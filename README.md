@@ -112,14 +112,40 @@ if  defined(CONFIG_SOC_FAMILY_NRF)
 ```
 
 Build config options:
+
 ```
 CONFIG_BT_MAX_CONN=15
+
 # allow changing value below
 CONFIG_BT_CTLR_ADVANCED_FEATURES=y
 # this must be increased from default=1
 CONFIG_BT_CTLR_LLCP_CONN=15
 
 CONFIG_BLUETOOTH_INT_EP_MPS=64
+
+
+### peripherals
+
+
+
+
+### Passkeys
+
+For peripherals requireing a passkey, use bt-agent from the bluez-tools package, install via package manager
+
+
+For fixed passkeys, add a file e.g.`pins.cfg`:
+
+```
+DD:EE:FF:00:11:22 123456
+```
+
+Add agent to automatically reply to passkey requests. `bt-agent` needs a restart or -USR1 signal to reload `pins.cfg`
+
+```
+bt-agent -p pins.cfg -c KeyboardOnly
+```
+
 
 
 
