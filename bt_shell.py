@@ -6,11 +6,10 @@ from argparse import ArgumentParser
 import pydbusbluez as bluez
 from pydbusbluez.format import FormatTuple, FormatRaw, FormatBase, FormatPacked, FormatUint
 
-from gi.repository.GObject import MainLoop
-from gi.repository.GLib import timeout_add_seconds
+from gi.repository.GLib import MainLoop, timeout_add_seconds
+from importlib import import_module
 
-
-from my_peripheral import GATT
+#from my_peripheral import GATT
 
 import cmd
 import time
@@ -55,11 +54,11 @@ class CmdTimeout(object):
 
         return not self.canceled
 
-def bt_connect(adapter, addr, timeout):
+def bt_connect(GATT, adapter, addr, timeout):
     d = None
     try:
         adapter_obj = bluez.Adapter(adapter)
-        devs = adapter_obj.devices():
+        devs = adapter_obj.devices()
         for d in devs:
             if d.name == addr.upper():
                 break
@@ -67,15 +66,15 @@ def bt_connect(adapter, addr, timeout):
             adapter_obj.scan()
             time.sleep(timeout)
 
-        devs = adapter_obj.devices():
+        devs = adapter_obj.devices()
         for d in devs:
             if d.name == addr.upper():
                 break
 
         if d:
             d.connect()
-        if d.connected():
-            return Gatt(d, GATT)
+        if d.connected:
+            return bluez.Gatt(d, GATT)
 
     except bluez.BluezError as e:
         print('Failed:', str(e), file=sys.stderr)
@@ -100,6 +99,8 @@ def main():
 
     parser.add_argument('-a', '--address', nargs='?', default=None, help='device address(es) to connect to')
 
+    parser.add_argument('-g', '--gatt', metavar='MOD', default=None, help='gatt description to import')
+
 
     parser.add_argument('script', default=None, nargs='*', type=str, help='commands to run from script(s), see the run/record commands')
 
@@ -109,15 +110,30 @@ def main():
     args = parser.parse_args()
 
 
+    if args.gatt:
+        try:
+            gatt_mod = import_module(args.gatt)
+        except ImportError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+        try:
+            GATT = gatt_mod.GATT
+        except AttributeError as e:
+            print('Failed to import gatt profile:', str(e), file=sys.stderr)
+    else:
+        GATT = []
+
+
     gatt = None
     if args.address:
-        gatt = bt_connect(args.adapter, args.address, args.scan_duration)
+        gatt = bt_connect(GATT, args.adapter, args.address, args.scan_duration)
 
 
-    shell = BTShell(gatt, args)
+    shell = BTShell(GATT, gatt, args)
     shell.make_prompt()
     # add connect command
-    shell.cmdqueue.append('connect '+ args.device)
+    if args.address:
+        shell.cmdqueue.append('connect '+ args.address)
     try:
         for script in args.script:
             with open(script) as f:
@@ -141,7 +157,7 @@ def _make_id(s):
 
 def _gatt_valid(gatt):
     try:
-        if gatt and gatt.dev and gatt.dev.connected():
+        if gatt and gatt.dev and gatt.dev.connected:
             return True
     except bluez.BluezError:
         pass
@@ -152,8 +168,9 @@ class BTShell(cmd.Cmd):
     prompt = '(bt) '
     file = None
 
-    def __init__(self, gatt, cli_args,  *args, **kwargs):
+    def __init__(self, GATT, gatt, cli_args,  *args, **kwargs):
         self.gatt = gatt
+        self.GATT = GATT
         self.cli_args = cli_args
         self.clp_cache = self.build_clpt_cache(GATT)
         self.autoconnect = False
@@ -162,7 +179,7 @@ class BTShell(cmd.Cmd):
 
     def make_prompt(self):
         if _gatt_valid(self.gatt):
-            self.prompt = '{}{} $ '.format(BTshell.prompt, self.gatt.dev.name)
+            self.prompt = '{}{} $ '.format(BTShell.prompt, self.gatt.dev.name)
         else:
             if self.autoconnect:
                 # try only once
@@ -171,9 +188,9 @@ class BTShell(cmd.Cmd):
                     self.autoconnect = True
                 else:
                     self.autoconnecting = True
-                    self.cmdqueue.append('connect ' + self.cli_args.device)
+                    self.cmdqueue.append('connect ' + self.cli_args.address)
             else:
-                self.prompt = '{}{} $ '.format(BTshell.prompt, 'disconnected')
+                self.prompt = '{}{} $ '.format(BTShell.prompt, 'disconnected')
 
     def build_clpt_cache(self, gatt_desc):
         ca = []
@@ -181,14 +198,32 @@ class BTShell(cmd.Cmd):
             for c in s['chars']:
                 el = _make_id(c['name'])
                 ca.append(el)
+                if 'descriptors' in c:
+                    for d in c['descriptors']:
+                        ca.append(el + '_' + _make_id(d['name']))
+        return ca
+
+    def build_clpt_cache_gatt(self):
+        ca = []
+        for s in self.gatt.services:
+            for c in s.chars:
+                el = _make_id(c.name)
+                ca.append(el)
+                for d in c.descriptors:
+                    ca.append(el + '_' + _make_id(d.name))
         return ca
 
     def find_char_obj(self, name):
         if self.gatt:
             for s in self.gatt.services:
                 for c in s.chars:
-                    if _make_id(c.name) == name:
+                    c_name = _make_id(c.name)
+                    if c_name == name:
                         return c
+                    if name.startswith(c_name):
+                        for d in c.descriptors:
+                            if c_name + '_' + _make_id(d.name) == name:
+                                return d
 
         else:
             print('Disconnected')
@@ -222,7 +257,7 @@ class BTShell(cmd.Cmd):
             print('set: ', arg, str(e), file=sys.stderr)
             return
         try:
-            exp = o.form(v)
+            exp = o.fmt(v)
         except Exception as e:
             print(str(e), file=sys.stderr)
             return
@@ -246,7 +281,7 @@ class BTShell(cmd.Cmd):
         if not o:
             print('complete not foud: ', pl[1], file=sys.stderr)
             return None
-        if not o.form:
+        if not o.fmt:
             print('format not foud: ', pl[1], file=sys.stderr)
             return None
 
@@ -288,12 +323,39 @@ class BTShell(cmd.Cmd):
             print('info: Expectect one arugment', file=sys.stderr)
             return
         o = self.find_char_obj(g_chars[0])
-        print('Service:', str(o.service))
-        print('Char   :', str(o))
-        if not issubclass(o.form, FormatBase):
+        if not o:
+            print('Not found:', g_chars[0])
+            return
+        d = None
+        if isinstance(o, bluez.GattDescriptor):
+            d = o
+            o = d.char
+        print(str(o.service))
+        print(str(o))
+        fmt = o.fmt
+        if d:
+            print(str(d))
+            fmt = d.fmt
+        else:
+            print(o.flags)
+
+        if not issubclass(fmt, FormatBase):
             print('Unkown format', file=sys.stderr)
         else:
-            print('Format :', str(o.form), file=sys.stderr)
+            if issubclass(fmt, FormatTuple):
+
+                fields = []
+                for idx, sc in enumerate(fmt.sub_cls):
+                    try:
+                        fields.append("'{}': {}".format(fmt.sub_cls_names[idx], sc.__name__))
+                    except (AttributeError, IndexError):
+                        fields.append("{}".format(sc.__name__))
+
+                print('{} ({})'.format(str(fmt.__name__), ', '.join(fields), file=sys.stderr))
+            else:
+                print('{} python native: {}'.format(str(fmt.__name__), str(fmt.native_types), file=sys.stderr))
+
+        print(str(fmt))
 
     complete_info = _char_names_complete
 
@@ -327,7 +389,7 @@ class BTShell(cmd.Cmd):
         'connect device or select device for interaction. When no paramter is given, -a option or last parameter will be used as address'
         args = _parse_args_simple(arg)
         if len(args) == 0:
-            if _gatt_valid(self.gatt) and self.gatt.dev.connected():
+            if _gatt_valid(self.gatt) and self.gatt.dev.connected:
                 print('Already connected', file=sys.stderr)
                 return
 
@@ -337,14 +399,17 @@ class BTShell(cmd.Cmd):
         else:
             self.cli_args.device = args[0]
 
-        if _gatt_valid(self.gatt) and self.gatt.dev.name.lower() == args[0].lower() and self.gatt.dev.connected():
+        if _gatt_valid(self.gatt) and self.gatt.dev.name.lower() == args[0].lower() and self.gatt.dev.connected:
             print('Already connected', file=sys.stderr)
+            self.clp_cache = self.build_clpt_cache_gatt()
             return
         self.gatt = None
 
         try:
-            self.gatt = bt_connect(self.cli_args.adapter, self.cli_args.device, self.cli_args.scan_duration)
+            self.gatt = bt_connect(self.GATT, self.cli_args.adapter, self.cli_args.device, self.cli_args.scan_duration)
             print('Connected', file=sys.stderr)
+            self.clp_cache = self.build_clpt_cache_gatt()
+
         except bluez.BluezError as e:
             print('connect', str(e), file=sys.stderr)
 
@@ -365,9 +430,88 @@ class BTShell(cmd.Cmd):
 
         return None
 
+    def do_db_schema(self, arg):
+        'dump resolved gatt schema'
+        if self.gatt:
+            self.gatt.dump()
+        else:
+            print('Disconnected', file=sys.stderr)
+
+    def do_dump_db_schema(self, arg):
+        'dump resolved db schema to file'
+        args = _parse_args_simple(arg)
+        if len(args) != 1:
+            print('Need file to dump schema into as argument')
+            return
+        f = args[0] if args[0].endswith('.py') else args[0] + '.py'
+        if not self.gatt or not self.gatt.dev.services_resolved:
+            print("DB not resolved, try connecting first", file=sys.stderr)
+            return
+        print("Writing", f)
+        with open(f, 'w') as schema_file:
+            header = [
+                'import pydbusbluez.format as fmt\n',
+                'import pydbusbluez.org_bluetooth\n',
+                '\n',
+            ]
+            footer = []
+            schema_file.writelines(header)
+            if self.gatt.dev.device_name:
+                schema_file.write('# GATT schema for {}\n'.format(self.gatt.dev.device_name))
+            schema_file.write('GATT = [\n')
+            for s in sorted(self.gatt.services, key=lambda x: x.uuid):
+                if s.obj:
+                    schema_file.writelines(
+                        ['\t{\n',
+                        '\t\t"name": "{}",\n'.format(s.name),
+                        '\t\t"uuid": "{}",\n'.format(s.uuid),
+                        '\t\t"chars": [\n'
+                        ]
+                    )
+                    for c in sorted(s.chars, key=lambda x: x.uuid):
+
+                        if c.obj:
+                            schema_file.writelines(
+                                ['\t\t\t{{ # {}\n'.format(c.flags),
+                                '\t\t\t\t"name": "{}",\n'.format(c.name),
+                                '\t\t\t\t"uuid": "{}",\n'.format(c.uuid),
+                                '\t\t\t\t"fmt": fmt.{},\n'.format(str(c.fmt)),
+                                ])
+                            if len(c.descriptors) > 0:
+                                schema_file.writelines(
+                                    [
+                                    '\t\t\t\t"descriptors": [\n'
+                                    ]
+                                )
+                            for d in sorted(c.descriptors, key=lambda x: x.uuid):
+                                if d.obj:
+                                    schema_file.writelines(
+                                        ['\t\t\t\t\t{\n',
+                                        '\t\t\t\t\t\t"name": "{}",\n'.format(d.name),
+                                        '\t\t\t\t\t\t"uuid": "{}",\n'.format(d.uuid),
+                                        '\t\t\t\t\t\t"fmt": fmt.{},\n'.format(str(d.fmt)),
+                                        '\t\t\t\t\t},\n',
+                                        ]
+                                    )
+                            if len(c.descriptors) > 0:
+                                #close descriptor list
+                                schema_file.write('\t\t\t\t],\n')
+
+                            # close char obj
+                            schema_file.write('\t\t\t},\n')
+
+                    # close char list
+                    schema_file.write('\t\t],\n')
+                    # close service obj
+                    schema_file.write('\t},\n')
+
+            # close service list
+            schema_file.write(']\n')
+            schema_file.writelines(footer)
+
     def do_disconnect(self, arg):
         'disconnect device currently selected device'
-        if self.gatt and self.gatt.dev and self.gatt.dev.connected():
+        if self.gatt and self.gatt.dev and self.gatt.dev.connected:
             g = self.gatt
             self.gatt = None
             g.dev.disconnect()
@@ -416,7 +560,7 @@ class BTShell(cmd.Cmd):
         for s in self.gatt.services:
             for c in s.chars:
                 try:
-                    flags = c.flags()
+                    flags = c.flags
                     if 'notify' in flags or 'indicate' in flags:
                         c.onValueChanged(generic_notify)
                         c.notifyOn()
@@ -446,6 +590,62 @@ class BTShell(cmd.Cmd):
             if timeout:
                 timeout.canceled = True
 
+    def complete_notify_single(self, text, line, begidx, endidx):
+        if len(line) != endidx:
+            return None
+        return self._char_names_complete(text, line, begidx, endidx)
+
+    def do_notify_single(self, arg):
+        'enable notifications on char and print changed values'
+        args = _parse_args_simple(arg)
+        timeout_seconds = None
+        if len(args) > 1:
+            try:
+                timeout_seconds = int(args[1])
+            except Exception as e:
+                print(str(e))
+                return
+        else:
+            print('To few arguments (char, [timeout[)')
+            return
+
+        g_char = self.find_char_obj(args[0])
+        if not g_char:
+            print(
+                'get:', str(g_char), 'Not valid in GATT database or not resolved', file=sys.stderr)
+            return
+
+        c = g_char
+        try:
+            flags = c.flags
+            if 'notify' in flags or 'indicate' in flags:
+                c.onValueChanged(generic_notify)
+                c.notifyOn()
+            elif 'read' in flags:
+                c.onValueChanged(generic_notify)
+
+        except bluez.BluezDoesNotExistError as e:
+            print(c.name, str(e), file=sys.stderr)
+
+        loop = MainLoop.new(None, False)
+
+        self.gatt.dev.onPropertiesChanged(dev_connected_changed)
+        timeout = None
+        if timeout_seconds:
+            timeout = CmdTimeout(timeout_seconds, loop)
+        try:
+            if timeout_seconds:
+                print('Notifying for {} seconds'.format(
+                    timeout_seconds), file=sys.stderr)
+            else:
+                print('Notifiying, CTRL+C to end', file=sys.stderr)
+
+            loop.run()
+        except (KeyboardInterrupt, bluez.BluezError) as e:
+            print('aborted:', self.gatt.dev.name, str(e), file=sys.stderr)
+            loop.quit()
+            if timeout:
+                timeout.canceled = True
 
 
 
